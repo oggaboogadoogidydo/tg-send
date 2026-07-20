@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# tg-send – send messages/files to a Telegram bot
+set -euo pipefail
+
+# ---------- Configuration file loading ----------
+# System-wide config
+if [[ -f /etc/tg-send.conf ]]; then
+    source /etc/tg-send.conf
+fi
+
+# User config (XDG compliant)
+if [[ -n "${XDG_CONFIG_HOME:-}" ]]; then
+    user_config="$XDG_CONFIG_HOME/tg-send/config"
+elif [[ -n "${HOME:-}" ]]; then
+    user_config="$HOME/.config/tg-send/config"
+else
+    user_config=""
+fi
+if [[ -n "$user_config" && -f "$user_config" ]]; then
+    source "$user_config"
+fi
+
+# Environment variables still have precedence (they are already set in the shell)
+# Command-line options will override everything later.
+
+# ---------- Defaults ----------
+TOKEN="${TG_TOKEN:-${TOKEN:-}}"
+CHAT_ID="${TG_CHAT_ID:-${CHAT_ID:-}}"
+MESSAGE=""
+FILE=""
+PARSE_MODE="${PARSE_MODE:-}"   # can also be set in config file
+
+usage() {
+    cat <<EOF
+Usage: tg-send [options] [message]
+
+Options:
+  -t TOKEN      Bot token (overrides \$TG_TOKEN and config file)
+  -c CHAT_ID    Chat ID (overrides \$TG_CHAT_ID and config file)
+  -m MESSAGE    Send this text message
+  -f FILE       Send this file (as document)
+  -p MODE       Parse mode for text (HTML/Markdown/MarkdownV2)
+  -h, --help    Show this help
+
+If no -m and no message argument is given, reads from stdin (unless stdin is a terminal).
+If -f is given, the file is sent as a document; any text is sent as caption.
+
+Configuration is read from:
+  /etc/tg-send.conf
+  ~/.config/tg-send/config  (or \$XDG_CONFIG_HOME/tg-send/config)
+Environment variables TG_TOKEN and TG_CHAT_ID override these.
+EOF
+    exit 0
+}
+
+# ---------- Parse command-line arguments ----------
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -t) TOKEN="$2"; shift 2 ;;
+        -c) CHAT_ID="$2"; shift 2 ;;
+        -m) MESSAGE="$2"; shift 2 ;;
+        -f) FILE="$2"; shift 2 ;;
+        -p) PARSE_MODE="$2"; shift 2 ;;
+        -h|--help) usage ;;
+        -*)
+            echo "Unknown option: $1" >&2
+            exit 1
+            ;;
+        *)
+            if [[ -z "$MESSAGE" ]]; then
+                MESSAGE="$1"
+            else
+                echo "Extra argument: $1 (ignored)" >&2
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Validate token and chat ID
+if [[ -z "$TOKEN" || -z "$CHAT_ID" ]]; then
+    echo "Error: Bot token and chat ID must be set via environment, config file, or -t/-c" >&2
+    exit 1
+fi
+
+# If no message set and no file, try reading stdin (if not a terminal)
+if [[ -z "$MESSAGE" && -z "$FILE" ]] && [[ ! -t 0 ]]; then
+    MESSAGE=$(cat)
+fi
+
+# If neither message nor file, show usage
+if [[ -z "$MESSAGE" && -z "$FILE" ]]; then
+    echo "Error: Nothing to send" >&2
+    usage
+fi
+
+# ---------- Build and send ----------
+API_URL="https://api.telegram.org/bot${TOKEN}"
+
+if [[ -n "$FILE" ]]; then
+    METHOD="sendDocument"
+    if [[ ! -f "$FILE" ]]; then
+        echo "Error: File not found: $FILE" >&2
+        exit 1
+    fi
+    curl -s -X POST "${API_URL}/sendDocument" \
+        -F "chat_id=${CHAT_ID}" \
+        -F "document=@${FILE}" \
+        -F "caption=${MESSAGE}" \
+        ${PARSE_MODE:+-F "parse_mode=${PARSE_MODE}"} \
+        | jq -e '.ok' >/dev/null
+else
+    ESCAPED=$(printf '%s' "$MESSAGE" | jq -sRr @json)
+    curl -s -X POST "${API_URL}/sendMessage" \
+        -d "chat_id=${CHAT_ID}" \
+        -d "text=${ESCAPED}" \
+        ${PARSE_MODE:+-d "parse_mode=${PARSE_MODE}"} \
+        | jq -e '.ok' >/dev/null
+fi
+
+if [[ $? -ne 0 ]]; then
+    echo "Error: Telegram API request failed" >&2
+    exit 1
+fi
